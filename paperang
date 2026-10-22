@@ -1,0 +1,186 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["pyusb", "pillow"]
+# ///
+"""PAPERANG P1 USB printing tool.
+
+Usage:
+  paperang text "こんにちは"          # print text (Japanese OK)
+  echo hello | paperang text          # text from stdin
+  paperang image photo.png            # print an image (scaled to 384px, dithered)
+  paperang file notes.txt             # print a text file
+  paperang selftest                   # print the printer's self-test page
+  paperang feed 10                    # feed paper 10mm
+
+Dependencies are resolved by uv from the inline metadata above (needs uv + Homebrew libusb).
+
+Protocol (same as Bluetooth, carried over USB bulk endpoints):
+  0x02 | cmd | index | len(u16 LE) | payload | crc32(payload, seed=key)(u32 LE) | 0x03
+  The CRC seed is 0x35769521 unless changed via SET_CRC_KEY (payload = key ^ 0x35769521).
+"""
+import argparse
+import struct
+import sys
+import time
+import zlib
+
+import usb.core
+import usb.util
+from PIL import Image, ImageDraw, ImageFont, ImageOps
+
+VID, PID = 0x4348, 0x5584
+EP_OUT = 0x02
+WIDTH = 384                    # dots per line
+LINE_BYTES = WIDTH // 8        # 48
+STANDARD_KEY = 0x35769521
+CHUNK = 1008                   # 21 lines per PRINT_DATA packet
+FEED_PER_MM = 25               # FEED_LINE units per mm (measured: 320 -> ~13mm)
+
+CMD_PRINT_DATA = 0
+CMD_SET_CRC_KEY = 24
+CMD_SET_HEAT_DENSITY = 25
+CMD_FEED_LINE = 26
+CMD_PRINT_TEST_PAGE = 27
+
+FONT_CANDIDATES = [
+    "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    "/Library/Fonts/Arial Unicode.ttf",
+]
+
+
+class Paperang:
+    def __init__(self):
+        self.dev = usb.core.find(idVendor=VID, idProduct=PID)
+        if self.dev is None:
+            sys.exit("PAPERANG P1 が見つかりません（電源・USBケーブルを確認してください）")
+        self.dev.set_configuration()
+        self.index = 0
+        # Make sure the printer uses the standard key (key = payload ^ STANDARD_KEY).
+        self.send(CMD_SET_CRC_KEY, struct.pack("<I", 0))
+
+    def send(self, cmd, data=b""):
+        pkt = (struct.pack("<BBBH", 2, cmd, self.index & 0xFF, len(data)) + data
+               + struct.pack("<I", zlib.crc32(data, STANDARD_KEY) & 0xFFFFFFFF) + b"\x03")
+        self.dev.write(EP_OUT, pkt, timeout=5000)
+        self.index += 1
+
+    def density(self, value):
+        self.send(CMD_SET_HEAT_DENSITY, bytes([max(0, min(100, value))]))
+
+    def feed(self, mm):
+        self.send(CMD_FEED_LINE, struct.pack("<H", min(0xFFFF, round(mm * FEED_PER_MM))))
+
+    def selftest(self):
+        self.send(CMD_PRINT_TEST_PAGE, b"\x00")
+
+    def print_image(self, img):
+        """img: PIL image already WIDTH px wide; converted to 1-bit (black = print)."""
+        bw = img.convert("1")
+        # PIL "1": 0 = black. Printer: bit 1 = black, MSB first.
+        raw = ImageOps.invert(bw.convert("L")).convert("1").tobytes()
+        for i in range(0, len(raw), CHUNK):
+            self.send(CMD_PRINT_DATA, raw[i:i + CHUNK])
+            time.sleep(0.02)  # don't outrun the print head over USB
+
+
+def fit_width(img):
+    img = ImageOps.exif_transpose(img)
+    if img.mode in ("RGBA", "LA", "P"):
+        img = img.convert("RGBA")
+        bg = Image.new("RGBA", img.size, "white")
+        img = Image.alpha_composite(bg, img)
+    img = img.convert("L")
+    h = round(img.height * WIDTH / img.width)
+    return img.resize((WIDTH, h), Image.LANCZOS)
+
+
+def load_font(size, path=None):
+    for p in ([path] if path else []) + FONT_CANDIDATES:
+        try:
+            return ImageFont.truetype(p, size)
+        except OSError:
+            continue
+    return ImageFont.load_default(size)
+
+
+def wrap(text, font, width):
+    lines = []
+    for para in text.splitlines() or [""]:
+        line = ""
+        for ch in para:
+            if font.getlength(line + ch) > width and line:
+                # prefer breaking at the last space for Latin text
+                cut = line.rfind(" ")
+                if cut > 0 and ch != " ":
+                    lines.append(line[:cut])
+                    line = line[cut + 1:] + ch
+                else:
+                    lines.append(line)
+                    line = ch.lstrip()
+            else:
+                line += ch
+        lines.append(line)
+    return lines
+
+
+def render_text(text, size, font_path=None, margin=4):
+    font = load_font(size, font_path)
+    lines = wrap(text, font, WIDTH - margin * 2)
+    asc, desc = font.getmetrics()
+    lh = asc + desc + size // 5
+    img = Image.new("L", (WIDTH, max(lh * len(lines), 1)), 255)
+    draw = ImageDraw.Draw(img)
+    for i, line in enumerate(lines):
+        draw.text((margin, i * lh), line, font=font, fill=0)
+    return img
+
+
+def main():
+    ap = argparse.ArgumentParser(description="PAPERANG P1 USB printer")
+    ap.add_argument("--density", type=int, default=None, help="印字濃度 0-100（未指定ならプリンタの設定のまま）")
+    ap.add_argument("--feed", type=float, default=15, help="印刷後の紙送り（mm、既定15）")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    t = sub.add_parser("text", help="テキストを印刷（引数なしなら標準入力）")
+    t.add_argument("text", nargs="*")
+    t.add_argument("--size", type=int, default=24, help="文字サイズ(px)")
+    t.add_argument("--font", help="フォントファイルのパス")
+    f = sub.add_parser("file", help="テキストファイルを印刷")
+    f.add_argument("path")
+    f.add_argument("--size", type=int, default=24)
+    f.add_argument("--font")
+    i = sub.add_parser("image", help="画像を印刷")
+    i.add_argument("path")
+    i.add_argument("--no-dither", action="store_true", help="ディザなし（ロゴ・QRコード向け）")
+    sub.add_parser("selftest", help="セルフテストページを印刷")
+    fd = sub.add_parser("feed", help="紙送り（mm）")
+    fd.add_argument("mm", type=float, nargs="?", default=10, help="送る長さ（mm、既定10）")
+    a = ap.parse_args()
+
+    if a.cmd in ("text", "file"):
+        if a.cmd == "file":
+            with open(a.path, encoding="utf-8") as fh:
+                text = fh.read()
+        else:
+            text = " ".join(a.text) if a.text else sys.stdin.read()
+        img = render_text(text.rstrip("\n"), a.size, a.font)
+    elif a.cmd == "image":
+        img = fit_width(Image.open(a.path))
+        if a.no_dither:
+            img = img.point(lambda v: 255 if v >= 128 else 0)
+
+    p = Paperang()
+    if a.density is not None:
+        p.density(a.density)
+    if a.cmd == "selftest":
+        p.selftest()
+    elif a.cmd == "feed":
+        p.feed(a.mm)
+    else:
+        p.print_image(img)
+        p.feed(a.feed)
+
+
+if __name__ == "__main__":
+    main()
