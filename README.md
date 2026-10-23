@@ -16,6 +16,7 @@ A tiny command-line tool to print text and images on a PAPERANG P1 thermal print
 - **日本語 OK**：テキストはヒラギノ角ゴシックで描画し、幅に合わせて自動で折り返します
 - **画像印刷**：用紙幅 384 ドットに合わせて縮小し、ディザリングで白黒に変換します（ロゴや QR コード向けに 2 値化だけのモードもあります）
 - **紙送りを mm で指定**：印刷後にカッターで切りやすい位置まで紙を送ります
+- **MCP サーバ付き**：`paperang-mcp` で Claude やローカル LLM から印刷できます（Tailscale で tailnet 内に公開する手順つき）
 
 ## 動作環境
 
@@ -34,7 +35,7 @@ cd paperang-p1-usb
 ./paperang selftest   # セルフテストページが出れば OK
 ```
 
-初回実行時に uv が依存ライブラリ（pyusb, pillow）を自動でダウンロードします。2 回目以降はキャッシュを使うのでオフラインでも動きます。
+初回実行時に uv が依存ライブラリ（pyusb, pillow。MCP サーバはこれに加えて mcp）を自動でダウンロードします。2 回目以降はキャッシュを使うのでオフラインでも動きます。
 
 どこからでも使いたい場合は、PATH の通ったディレクトリにリンクを張ってください。
 
@@ -59,6 +60,56 @@ echo hello | ./paperang text           # 標準入力から
 ```
 
 `--density` と `--feed` はサブコマンドの前に書きます。
+
+## MCP サーバ
+
+`paperang-mcp` は、プリンタを MCP（Model Context Protocol）のツールとして公開するサーバです。Claude や、MCP に対応したローカル LLM のクライアントから印刷できます。通信方式は Streamable HTTP です。
+
+| ツール | 内容 |
+|---|---|
+| `print_text` | テキストを印刷（`text`, `size`, `density`, `feed_mm`） |
+| `print_image` | 画像を印刷（`image_base64` か `image_url` のどちらか, `dither`, `density`, `feed_mm`） |
+| `feed` | 紙送り（`mm`） |
+| `selftest` | セルフテストページ |
+
+### 起動
+
+```sh
+./paperang-mcp                 # http://127.0.0.1:9900/mcp で待ち受け
+./paperang-mcp --port 9000     # ポートを変える
+```
+
+サーバは `127.0.0.1` でしか待ち受けないので、そのままでは同じ Mac からしか使えません。
+
+### Tailscale で tailnet 内に公開する
+
+[Tailscale](https://tailscale.com/) の `tailscale serve` を使うと、同じ tailnet の機器からだけ接続できるようになります（インターネットには公開されません）。
+
+```sh
+# Mac アプリ版の CLI は /Applications/Tailscale.app/Contents/MacOS/Tailscale
+tailscale serve --bg --http=9900 http://127.0.0.1:9900
+
+# tailnet 上の名前を Host ヘッダとして許可して起動する
+./paperang-mcp --allow-host <machine>.<tailnet>.ts.net --allow-host <machine>
+```
+
+クライアントからは `http://<machine>.<tailnet>.ts.net:9900/mcp` に接続します。
+
+- `--allow-host` が必要なのは、DNS リバインディング対策で、知らない Host ヘッダのリクエストを拒否しているためです
+- IP アドレス（`100.x.y.z`）では接続できません。`tailscale serve` は名前でアクセスされたときだけ転送します
+- 公開をやめるときは `tailscale serve --http=9900 off`
+
+Claude Code に登録する例：
+
+```sh
+claude mcp add --transport http paperang http://<machine>.<tailnet>.ts.net:9900/mcp
+```
+
+### 注意
+
+- プリンタは状態を返さないので、ツールが成功しても「データを送った」という意味でしかありません
+- 1 回の印刷は 4000 行（約 50cm）、テキストは 5000 文字までに制限しています
+- 認証はありません。tailnet 内の機器なら誰でも印刷できます
 
 ## トラブルシューティング
 

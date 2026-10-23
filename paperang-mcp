@@ -1,0 +1,171 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["mcp>=2.3,<3", "pyusb", "pillow"]
+# ///
+"""MCP server (Streamable HTTP) for the PAPERANG P1, reusing the `paperang` CLI's printing code.
+
+Listens on 127.0.0.1 only; expose it to your tailnet with `tailscale serve` (see README).
+
+  paperang-mcp [--port 9900] [--allow-host mac-mini.example.ts.net ...]
+
+Endpoint: http://127.0.0.1:9900/mcp
+"""
+import argparse
+import base64
+import importlib.machinery
+import importlib.util
+import io
+import os
+import threading
+import urllib.request
+
+import anyio
+import usb.core
+import usb.util
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.transport_security import TransportSecuritySettings
+from PIL import Image
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+_loader = importlib.machinery.SourceFileLoader("paperang", os.path.join(HERE, "paperang"))
+_spec = importlib.util.spec_from_loader("paperang", _loader)
+pp = importlib.util.module_from_spec(_spec)
+_loader.exec_module(pp)
+
+MAX_ROWS = 4000                  # ~50cm of paper; guards against runaway jobs
+MAX_TEXT = 5000                  # characters
+MAX_DOWNLOAD = 10 * 1024 * 1024  # bytes
+
+_lock = threading.Lock()         # one job at a time on the USB device
+
+mcp = MCPServer(
+    "paperang",
+    instructions=(
+        "Prints on a PAPERANG P1 thermal receipt printer (384 dots = 48mm wide, black and white). "
+        "The printer sends no status back: a successful call means the job was sent, not that paper came out."
+    ),
+)
+
+
+def _open():
+    try:
+        return pp.Paperang()
+    except SystemExit as e:  # pp.Paperang exits when the printer is missing
+        raise ToolError(f"{e}（自動で電源が切れている可能性があります）") from None
+
+
+def _usb(fn):
+    """Open the printer, run fn(printer) holding the device lock, then release the device.
+
+    The handle must be released after every job: macOS keeps the interface claimed
+    by this process otherwise, and the next open fails with "Access denied".
+    """
+    with _lock:
+        p = None
+        try:
+            p = _open()
+            return fn(p)
+        except usb.core.USBError as e:
+            raise ToolError(f"USB error: {e}") from None
+        finally:
+            if p is not None:
+                usb.util.dispose_resources(p.dev)
+
+
+def _print(img, density, feed_mm):
+    if img.height > MAX_ROWS:
+        raise ToolError(f"too long to print: {img.height} rows (max {MAX_ROWS})")
+    def run(p):
+        if density is not None:
+            p.density(density)
+        p.print_image(img)
+        p.feed(feed_mm)
+    _usb(run)
+    return f"sent: {img.height} rows, fed {feed_mm}mm"
+
+
+@mcp.tool()
+async def print_text(text: str, size: int = 24, density: int | None = None, feed_mm: float = 15) -> str:
+    """Print text (Japanese OK, wrapped to the paper width).
+
+    size: font size in px (24 fits ~15 full-width characters per line).
+    density: heat density 0-100; omit to keep the printer's setting.
+    feed_mm: paper feed after printing so the text clears the tear-off edge.
+    """
+    if len(text) > MAX_TEXT:
+        raise ToolError(f"text too long: {len(text)} chars (max {MAX_TEXT})")
+    img = pp.render_text(text.rstrip("\n"), max(8, min(200, size)))
+    return await anyio.to_thread.run_sync(_print, img, density, feed_mm)
+
+
+@mcp.tool()
+async def print_image(image_base64: str | None = None, image_url: str | None = None, dither: bool = True,
+                      density: int | None = None, feed_mm: float = 15) -> str:
+    """Print an image, scaled to the 384-dot paper width.
+
+    Pass exactly one of image_base64 (raw base64 or a data: URL) or image_url (http/https).
+    dither: true for photos; false for logos, QR codes and line art (plain threshold).
+    """
+    if bool(image_base64) == bool(image_url):
+        raise ToolError("pass exactly one of image_base64 or image_url")
+    if image_url:
+        if not image_url.startswith(("http://", "https://")):
+            raise ToolError("image_url must be http or https")
+        def fetch():
+            try:
+                with urllib.request.urlopen(image_url, timeout=20) as r:
+                    data = r.read(MAX_DOWNLOAD + 1)
+            except OSError as e:  # URLError, HTTPError and timeouts are all OSError
+                raise ToolError(f"could not fetch image_url: {e}") from None
+            if len(data) > MAX_DOWNLOAD:
+                raise ToolError("image too large (max 10MB)")
+            return data
+        data = await anyio.to_thread.run_sync(fetch)
+    else:
+        if image_base64.startswith("data:"):
+            image_base64 = image_base64.split(",", 1)[1]
+        try:
+            data = base64.b64decode(image_base64)
+        except ValueError:
+            raise ToolError("image_base64 is not valid base64") from None
+    try:
+        img = pp.fit_width(Image.open(io.BytesIO(data)))
+    except OSError:
+        raise ToolError("could not decode the image") from None
+    if not dither:
+        img = img.point(lambda v: 255 if v >= 128 else 0)
+    return await anyio.to_thread.run_sync(_print, img, density, feed_mm)
+
+
+@mcp.tool()
+async def feed(mm: float = 10) -> str:
+    """Feed paper by the given length in mm."""
+    await anyio.to_thread.run_sync(_usb, lambda p: p.feed(mm))
+    return f"fed {mm}mm"
+
+
+@mcp.tool()
+async def selftest() -> str:
+    """Print the printer's built-in self-test page."""
+    await anyio.to_thread.run_sync(_usb, lambda p: p.selftest())
+    return "self-test page requested"
+
+
+def main():
+    ap = argparse.ArgumentParser(description="PAPERANG P1 MCP server")
+    ap.add_argument("--port", type=int, default=9900)
+    ap.add_argument("--allow-host", action="append", default=[],
+                    help="extra Host header to accept (e.g. your tailnet name); repeatable")
+    a = ap.parse_args()
+    hosts = ["127.0.0.1", "localhost", "[::1]"] + a.allow_host
+    security = TransportSecuritySettings(
+        allowed_hosts=[h for host in hosts for h in (host, f"{host}:*")],
+        allowed_origins=[f"{s}://{h}" for host in hosts for s in ("http", "https") for h in (host, f"{host}:*")],
+    )
+    anyio.run(lambda: mcp.run_streamable_http_async(host="127.0.0.1", port=a.port, transport_security=security))
+
+
+if __name__ == "__main__":
+    main()
